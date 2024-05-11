@@ -1,71 +1,187 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"math/rand"
+	"net/rpc"
+	"os"
+	"strconv"
+	"time"
+)
 
-
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+type task struct {
+	mapOrReduce string
+	inputKeys   []string
+	nReduce     int
+	taskId      string
+	expiration  time.Time
+}
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	log.SetOutput(io.Discard)
+	workerId := strconv.Itoa(rand.Intn(1e9))
+	for {
+		t := getTask(workerId)
+		switch t.mapOrReduce {
+		case "map":
+			handleMapTask(mapf, t.inputKeys, t.nReduce, t.taskId, t.expiration)
+		case "reduce":
+			handleReduceTask(reducef, t.inputKeys, t.taskId, t.expiration)
+		case "wait":
+		default:
+			return
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func handleMapTask(mapf func(string, string) []KeyValue, inputKeys []string, nReduce int, taskId string, expiration time.Time) {
+	if len(inputKeys) != 1 {
+		log.Fatal("Only one input key supported for map operations")
+	}
+	inputKey := inputKeys[0]
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	rawContent, err := os.ReadFile(inputKey)
+	if err != nil {
+		log.Fatalf("Error reading file: %v", err)
+	}
+	content := string(rawContent)
+	keyValues := mapf(inputKey, content)
 
-	// fill in the argument(s).
-	args.X = 99
+	if isExpired(expiration) {
+		return
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	keyValuesByPartitionKey := make(map[string][]KeyValue)
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+	for _, kv := range keyValues {
+		partitionKey := strconv.Itoa(ihash(kv.Key) % nReduce)
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+		values := keyValuesByPartitionKey[partitionKey]
+
+		if values == nil {
+			values = []KeyValue{}
+		}
+
+		keyValuesByPartitionKey[partitionKey] = append(values, kv)
+	}
+
+	outputFilenamesByPartitionKey := make(map[string]string)
+
+	for partitionKey, keyValues := range keyValuesByPartitionKey {
+		outputFilename := fmt.Sprintf("%s-%s.json", taskId, partitionKey)
+		log.Printf("Creating output file %s", outputFilename)
+		file, err := os.Create(outputFilename)
+		if err != nil {
+			log.Fatal("Error creating file")
+		}
+		encoder := json.NewEncoder(file)
+		encodingErr := encoder.Encode(keyValues)
+		if encodingErr != nil {
+			log.Fatal("Error encoding intermediate key values")
+		}
+		file.Close()
+		outputFilenamesByPartitionKey[partitionKey] = outputFilename
+	}
+
+	completeTask(taskId, outputFilenamesByPartitionKey)
 }
 
-//
+func handleReduceTask(reducef func(string, []string) string, inputKeys []string, taskId string, expiration time.Time) {
+	keyValues := make(map[string][]string)
+	for _, inputKey := range inputKeys {
+		rawContent, err := os.ReadFile(inputKey)
+		if err != nil {
+			log.Fatalf("Error reading file: %v", err)
+		}
+
+		var pairs []KeyValue
+		err = json.Unmarshal(rawContent, &pairs)
+		if err != nil {
+			log.Fatal("Error unmarshaling JSON:", err)
+		}
+
+		for _, pair := range pairs {
+			values := keyValues[pair.Key]
+
+			if values == nil {
+				values = []string{}
+			}
+			keyValues[pair.Key] = append(values, pair.Value)
+		}
+	}
+
+	outputFilename := fmt.Sprintf("mr-out-%v", string(taskId[1]))
+	file, err := os.Create(outputFilename)
+	if err != nil {
+		log.Fatal("Error creating file")
+	}
+
+	formattedOutputs := []string{}
+
+	for key, values := range keyValues {
+		output := reducef(key, values)
+		formattedOutput := fmt.Sprintf("%v %v\n", key, output)
+		formattedOutputs = append(formattedOutputs, formattedOutput)
+	}
+
+	if isExpired(expiration) {
+		return
+	}
+
+	for _, formattedOutput := range formattedOutputs {
+		_, writeErr := file.Write([]byte(formattedOutput))
+		if writeErr != nil {
+			log.Fatal("Error writing to file")
+		}
+	}
+	completeTask(taskId, nil)
+}
+
+func getTask(workerId string) task {
+	args := GetTaskArgs{WorkerId: workerId}
+	reply := GetTaskReply{}
+	log.Printf("Sending GetTaskArgs: %#v\n", args)
+	call("Master.GetTask", &args, &reply)
+	log.Printf("Received GetTaskReply: %#v\n", reply)
+
+	// Map reply to task
+	return task{mapOrReduce: reply.MapOrReduce, inputKeys: reply.InputKeys, nReduce: reply.NReduce, taskId: reply.TaskId, expiration: reply.Expiration}
+}
+
+func completeTask(taskId string, outputFilenamesByPartitionKey map[string]string) {
+	args := CompleteTaskArgs{TaskId: taskId, OutputFilenamesByPartitionKey: outputFilenamesByPartitionKey}
+	reply := CompleteTaskReply{}
+	log.Printf("Sending CompleteTaskArgs: %#v\n", args)
+	call("Master.CompleteTask", &args, &reply)
+	log.Printf("Received CompleteTaskReply: %#v\n", reply)
+}
+
+func isExpired(expiration time.Time) bool {
+	return time.Now().UTC().After(expiration)
+}
+
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
@@ -80,6 +196,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	log.Println(err)
 	return false
 }

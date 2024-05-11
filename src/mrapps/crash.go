@@ -8,7 +8,7 @@ package main
 // go build -buildmode=plugin crash.go
 //
 
-import "../mr"
+import "6.824/mr"
 import crand "crypto/rand"
 import "math/big"
 import "strings"
@@ -25,7 +25,7 @@ func maybeCrash() {
 		os.Exit(1)
 	} else if rr.Int64() < 660 {
 		// delay for a while.
-		maxms := big.NewInt(10 * 1000)
+		maxms := big.NewInt(3 * 1000)
 		ms, _ := crand.Int(crand.Reader, maxms)
 		time.Sleep(time.Duration(ms.Int64()) * time.Millisecond)
 	}
