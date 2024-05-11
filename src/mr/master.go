@@ -12,47 +12,57 @@ import (
 	"time"
 )
 
+const (
+	stateIdle       = iota
+	stateInProgress = iota
+	stateComplete   = iota
+)
+
+const (
+	timeoutSeconds = 3
+)
+
 type Task struct {
-	mapOrReduce string
-	state       string
-	taskId      string
-	inputKeys   []string
-	workerId    string
-	startTime	time.Time
+	taskType  int // We reuse the enums from rpc.go -- could use our own internal repr
+	state     int
+	taskId    string
+	inputKeys []string
+	workerId  string
+	startTime time.Time
 }
 
 type Master struct {
-	files                            []string
-	tasksById                        map[string]*Task
-	tasksByIdLock sync.Mutex
-	mapOutputFilenamesByPartitionKey map[string][]string
-	mapOutputFilenamesByPartitionKeyLock sync.Mutex
-	nReduce                          int
-	isMapDone                        bool
-	isReduceDone                     bool
+	inputFiles                          []string
+	tasksById                           map[string]*Task
+	tasksByIdLock                       sync.Mutex
+	intermediateFilesByPartitionKey     map[string][]string
+	intermediateFilesByPartitionKeyLock sync.Mutex
+	nReduce                             int
+	isMapDone                           bool
+	isReduceDone                        bool
 }
 
 func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	log.Printf("Serving GetTask with args %#v\n", args)
 	if m.isMapDone && m.isReduceDone {
-		reply.MapOrReduce = ""
+		reply.TaskType = TaskTypeDone
 	} else {
-		reply.MapOrReduce = "wait"
+		reply.TaskType = TaskTypeWait
 	}
 	m.tasksByIdLock.Lock()
 
 	for _, task := range m.tasksById {
-		if task.state != "idle" {
+		if task.state != stateIdle {
 			continue
 		}
 		t := time.Now().UTC()
-		reply.MapOrReduce = task.mapOrReduce
+		reply.TaskType = task.taskType
 		reply.InputKeys = task.inputKeys
 		reply.NReduce = m.nReduce
 		reply.TaskId = task.taskId
 		reply.Expiration = t.Add(3 * time.Second)
 		task.workerId = args.WorkerId
-		task.state = "inProgress"
+		task.state = stateInProgress
 		task.startTime = t
 		break
 	}
@@ -66,20 +76,20 @@ func (m *Master) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) 
 	log.Printf("Serving CompleteTask with args %#v\n", args)
 	m.tasksByIdLock.Lock()
 	task := m.tasksById[args.TaskId]
-	task.state = "complete"
+	task.state = stateComplete
 	m.tasksByIdLock.Unlock()
 
-	m.mapOutputFilenamesByPartitionKeyLock.Lock()
-	for partitionKey, outputFilename := range args.OutputFilenamesByPartitionKey {
-		outputFilenames := m.mapOutputFilenamesByPartitionKey[partitionKey]
+	m.intermediateFilesByPartitionKeyLock.Lock()
+	for partitionKey, outputFilename := range args.IntermediateFilesByPartitionKey {
+		outputFilenames := m.intermediateFilesByPartitionKey[partitionKey]
 
 		if outputFilenames == nil {
 			outputFilenames = []string{}
 		}
 
-		m.mapOutputFilenamesByPartitionKey[partitionKey] = append(outputFilenames, outputFilename)
+		m.intermediateFilesByPartitionKey[partitionKey] = append(outputFilenames, outputFilename)
 	}
-	m.mapOutputFilenamesByPartitionKeyLock.Unlock()
+	m.intermediateFilesByPartitionKeyLock.Unlock()
 
 	log.Printf("Serving CompleteTask reply %#v\n", reply)
 	return nil
@@ -104,10 +114,10 @@ func (m *Master) server() {
 func (m *Master) main() {
 	// Map phase
 	m.tasksByIdLock.Lock()
-	for i := 0; i < len(m.files); i++ {
+	for i := 0; i < len(m.inputFiles); i++ {
 		// Create map tasks for each of the input files
 		taskId := fmt.Sprintf("m%v", i)
-		task := Task{mapOrReduce: "map", state: "idle", taskId: taskId, inputKeys: []string{m.files[i]}}
+		task := Task{taskType: TaskTypeMap, state: stateIdle, taskId: taskId, inputKeys: []string{m.inputFiles[i]}}
 		m.tasksById[taskId] = &task
 	}
 	m.tasksByIdLock.Unlock()
@@ -120,13 +130,13 @@ func (m *Master) main() {
 	}
 	// Reduce phase
 	m.tasksByIdLock.Lock()
-	m.mapOutputFilenamesByPartitionKeyLock.Lock()
-	for key, outputFilenames := range m.mapOutputFilenamesByPartitionKey {
+	m.intermediateFilesByPartitionKeyLock.Lock()
+	for key, outputFilenames := range m.intermediateFilesByPartitionKey {
 		taskId := fmt.Sprintf("r%v", key)
-		task := Task{mapOrReduce: "reduce", state: "idle", taskId: taskId, inputKeys: outputFilenames}
+		task := Task{taskType: TaskTypeReduce, state: stateIdle, taskId: taskId, inputKeys: outputFilenames}
 		m.tasksById[taskId] = &task
 	}
-	m.mapOutputFilenamesByPartitionKeyLock.Unlock()
+	m.intermediateFilesByPartitionKeyLock.Unlock()
 	m.tasksByIdLock.Unlock()
 
 	for {
@@ -142,13 +152,13 @@ func (m *Master) cleanUpStaleTasks() {
 	for {
 		m.tasksByIdLock.Lock()
 		for _, task := range m.tasksById {
-			if task.workerId == "" || task.state != "inProgress" {
+			if task.workerId == "" || task.state != stateInProgress {
 				continue
 			}
 			t := time.Now().UTC().Sub(task.startTime)
-			if t >= 3 * time.Second {
+			if t >= timeoutSeconds*time.Second {
 				task.startTime = time.Time{}
-				task.state = "idle"
+				task.state = stateIdle
 				task.workerId = ""
 			}
 		}
@@ -161,7 +171,7 @@ func (m *Master) isTasksDone() bool {
 	m.tasksByIdLock.Lock()
 	defer m.tasksByIdLock.Unlock()
 	for _, task := range m.tasksById {
-		if task.state != "complete" {
+		if task.state != stateComplete {
 			return false
 		}
 	}
@@ -180,14 +190,14 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	log.SetOutput(io.Discard)
 	m := Master{}
-	m.files = files
+	m.inputFiles = files
 	m.nReduce = nReduce
 	m.isMapDone = false
 	m.isReduceDone = false
 	m.tasksById = make(map[string]*Task)
 	m.tasksByIdLock = sync.Mutex{}
-	m.mapOutputFilenamesByPartitionKey = make(map[string][]string)
-	m.mapOutputFilenamesByPartitionKeyLock = sync.Mutex{}
+	m.intermediateFilesByPartitionKey = make(map[string][]string)
+	m.intermediateFilesByPartitionKeyLock = sync.Mutex{}
 	m.server()
 	return &m
 }

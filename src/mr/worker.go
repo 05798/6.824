@@ -20,11 +20,11 @@ type KeyValue struct {
 }
 
 type task struct {
-	mapOrReduce string
-	inputKeys   []string
-	nReduce     int
-	taskId      string
-	expiration  time.Time
+	taskType   int
+	inputKeys  []string
+	nReduce    int
+	taskId     string
+	expiration time.Time
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -41,14 +41,16 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	workerId := strconv.Itoa(rand.Intn(1e9))
 	for {
 		t := getTask(workerId)
-		switch t.mapOrReduce {
-		case "map":
+		switch t.taskType {
+		case TaskTypeMap:
 			handleMapTask(mapf, t.inputKeys, t.nReduce, t.taskId, t.expiration)
-		case "reduce":
+		case TaskTypeReduce:
 			handleReduceTask(reducef, t.inputKeys, t.taskId, t.expiration)
-		case "wait":
-		default:
+		case TaskTypeWait:
+		case TaskTypeDone:
 			return
+		default:
+			log.Println("Unknown task type")
 		}
 	}
 }
@@ -84,7 +86,7 @@ func handleMapTask(mapf func(string, string) []KeyValue, inputKeys []string, nRe
 		keyValuesByPartitionKey[partitionKey] = append(values, kv)
 	}
 
-	outputFilenamesByPartitionKey := make(map[string]string)
+	outputFilesByPartitionKey := make(map[string]string)
 
 	for partitionKey, keyValues := range keyValuesByPartitionKey {
 		outputFilename := fmt.Sprintf("%s-%s.json", taskId, partitionKey)
@@ -99,10 +101,10 @@ func handleMapTask(mapf func(string, string) []KeyValue, inputKeys []string, nRe
 			log.Fatal("Error encoding intermediate key values")
 		}
 		file.Close()
-		outputFilenamesByPartitionKey[partitionKey] = outputFilename
+		outputFilesByPartitionKey[partitionKey] = outputFilename
 	}
 
-	completeTask(taskId, outputFilenamesByPartitionKey)
+	completeTask(taskId, outputFilesByPartitionKey)
 }
 
 func handleReduceTask(reducef func(string, []string) string, inputKeys []string, taskId string, expiration time.Time) {
@@ -164,11 +166,11 @@ func getTask(workerId string) task {
 	log.Printf("Received GetTaskReply: %#v\n", reply)
 
 	// Map reply to task
-	return task{mapOrReduce: reply.MapOrReduce, inputKeys: reply.InputKeys, nReduce: reply.NReduce, taskId: reply.TaskId, expiration: reply.Expiration}
+	return task{taskType: reply.TaskType, inputKeys: reply.InputKeys, nReduce: reply.NReduce, taskId: reply.TaskId, expiration: reply.Expiration}
 }
 
 func completeTask(taskId string, outputFilenamesByPartitionKey map[string]string) {
-	args := CompleteTaskArgs{TaskId: taskId, OutputFilenamesByPartitionKey: outputFilenamesByPartitionKey}
+	args := CompleteTaskArgs{TaskId: taskId, IntermediateFilesByPartitionKey: outputFilenamesByPartitionKey}
 	reply := CompleteTaskReply{}
 	log.Printf("Sending CompleteTaskArgs: %#v\n", args)
 	call("Master.CompleteTask", &args, &reply)

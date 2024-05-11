@@ -12,20 +12,27 @@ import (
 	"time"
 )
 
+const (
+	TaskTypeMap    = iota
+	TaskTypeReduce = iota
+	TaskTypeWait   = iota
+	TaskTypeDone   = iota
+)
+
 type GetTaskArgs struct {
 	WorkerId string
 }
 type GetTaskReply struct {
-	MapOrReduce string
-	InputKeys []string
-	NReduce   int
-	TaskId    string
+	TaskType   int
+	InputKeys  []string
+	NReduce    int
+	TaskId     string
 	Expiration time.Time
 }
 
 type CompleteTaskArgs struct {
-	TaskId                        string
-	OutputFilenamesByPartitionKey map[string]string
+	TaskId                          string
+	IntermediateFilesByPartitionKey map[string]string  // Only relevant for map tasks
 }
 
 type CompleteTaskReply struct {
