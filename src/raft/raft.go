@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	"io"
 	"6.824/labrpc"
 )
 
@@ -81,7 +81,10 @@ type Raft struct {
 
 func (rf *Raft) main() {
 	for {
-		switch rf.status {
+		rf.mu.Lock()
+		status := rf.status
+		rf.mu.Unlock()
+		switch status {
 		case StatusFollower:
 			rf.handleFollower()
 		case StatusCandidate:
@@ -124,7 +127,6 @@ func (rf *Raft) callElection() {
 	rf.mu.Lock()
 	rf.persistentState.currentTerm += 1
 	rf.lastLeaderMessageTime = time.Now().UTC()
-	rf.mu.Unlock()
 
 	electionMu := sync.Mutex{}
 	electionCond := sync.NewCond(&electionMu)
@@ -133,20 +135,23 @@ func (rf *Raft) callElection() {
 
 	voteCount := 1
 	replyCount := 1
+	rf.mu.Unlock()
 
 	for i := 0; i < totalCount; i++ {
 		if i == rf.me {
 			continue
 		}
 		go func(peer int) {
-			log.Printf("%v %v %#v callElection -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
 			rf.mu.Lock()
+			log.Printf("%v %v %#v callElection -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
 			args := RequestVoteArgs{Term: rf.persistentState.currentTerm, CandidateId: rf.me}
 			reply := RequestVoteReply{}
 			rf.mu.Unlock()
 			success := rf.sendRequestVote(peer, &args, &reply)
 			electionMu.Lock()
 			defer electionMu.Unlock()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			log.Printf("%v %v %#v callElection -- received response from %v", rf.me, rf.status, rf.persistentState, peer)
 			replyCount += 1
 			if success && reply.VoteGranted {
@@ -178,12 +183,14 @@ func (rf *Raft) handleLeader() {
 			continue
 		}
 		go func(peer int) {
-			log.Printf("%v %v %#v handleLeader -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
 			rf.mu.Lock()
+			log.Printf("%v %v %#v handleLeader -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
 			args := AppendEntriesArgs{Term: rf.persistentState.currentTerm, LeaderId: rf.me}
 			reply := AppendEntriesReply{}
 			rf.mu.Unlock()
 			rf.sendAppendEntries(peer, &args, &reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			log.Printf("%v %v %#v handleLeader -- received response from %v", rf.me, rf.status, rf.persistentState, peer)
 		}(i)
 	}
@@ -250,9 +257,9 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
 	log.Printf("%v %v %#v RequestVote -- received args %#v", rf.me, rf.status, rf.persistentState, args)
 	defer log.Printf("%v %v %#v RequestVote -- responding with reply %#v", rf.me, rf.status, rf.persistentState, reply)
-	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.persistentState.currentTerm {
 		log.Printf("%v %v %#v RequestVote -- setting term to %v", rf.me, rf.status, rf.persistentState, args.Term)
@@ -290,9 +297,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
 	log.Printf("%v %v %#v AppendEntries -- received args %#v", rf.me, rf.status, rf.persistentState, args)
 	defer log.Printf("%v %v %#v AppendEntries -- responding with reply %#v", rf.me, rf.status, rf.persistentState, reply)
-	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.persistentState.currentTerm {
 		log.Printf("%v %v %#v AppendEntries -- setting term to %v", rf.me, rf.status, rf.persistentState, args.Term)
@@ -401,6 +408,7 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	log.SetOutput(io.Discard)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
