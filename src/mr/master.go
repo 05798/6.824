@@ -81,13 +81,7 @@ func (m *Master) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) 
 	task.state = stateComplete
 
 	for partitionKey, outputFilename := range args.IntermediateFilesByPartitionKey {
-		outputFilenames := m.intermediateFilesByPartitionKey[partitionKey]
-
-		if outputFilenames == nil {
-			outputFilenames = []string{}
-		}
-
-		m.intermediateFilesByPartitionKey[partitionKey] = append(outputFilenames, outputFilename)
+		m.intermediateFilesByPartitionKey[partitionKey] = append(m.intermediateFilesByPartitionKey[partitionKey], outputFilename)
 	}
 
 	log.Printf("Serving CompleteTask reply %#v\n", reply)

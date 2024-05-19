@@ -76,14 +76,7 @@ func handleMapTask(mapf func(string, string) []KeyValue, inputKeys []string, nRe
 
 	for _, kv := range keyValues {
 		partitionKey := strconv.Itoa(ihash(kv.Key) % nReduce)
-
-		values := keyValuesByPartitionKey[partitionKey]
-
-		if values == nil {
-			values = []KeyValue{}
-		}
-
-		keyValuesByPartitionKey[partitionKey] = append(values, kv)
+		keyValuesByPartitionKey[partitionKey] = append(keyValuesByPartitionKey[partitionKey], kv)
 	}
 
 	outputFilesByPartitionKey := make(map[string]string)
@@ -122,12 +115,7 @@ func handleReduceTask(reducef func(string, []string) string, inputKeys []string,
 		}
 
 		for _, pair := range pairs {
-			values := keyValues[pair.Key]
-
-			if values == nil {
-				values = []string{}
-			}
-			keyValues[pair.Key] = append(values, pair.Value)
+			keyValues[pair.Key] = append(keyValues[pair.Key], pair.Value)
 		}
 	}
 
