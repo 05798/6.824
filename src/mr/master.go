@@ -34,9 +34,9 @@ type Task struct {
 type Master struct {
 	inputFiles                          []string
 	tasksById                           map[string]*Task
-	tasksByIdLock                       sync.Mutex
+	mu                       			sync.Mutex
+	cond								sync.Cond
 	intermediateFilesByPartitionKey     map[string][]string
-	intermediateFilesByPartitionKeyLock sync.Mutex
 	nReduce                             int
 	isMapDone                           bool
 	isReduceDone                        bool
@@ -44,12 +44,13 @@ type Master struct {
 
 func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	log.Printf("Serving GetTask with args %#v\n", args)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.isMapDone && m.isReduceDone {
 		reply.TaskType = TaskTypeDone
 	} else {
 		reply.TaskType = TaskTypeWait
 	}
-	m.tasksByIdLock.Lock()
 
 	for _, task := range m.tasksById {
 		if task.state != stateIdle {
@@ -67,19 +68,18 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		break
 	}
 
-	m.tasksByIdLock.Unlock()
 	log.Printf("Setting GetTask reply %#v\n", reply)
+	m.cond.Broadcast()
 	return nil
 }
 
 func (m *Master) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) error {
 	log.Printf("Serving CompleteTask with args %#v\n", args)
-	m.tasksByIdLock.Lock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	task := m.tasksById[args.TaskId]
 	task.state = stateComplete
-	m.tasksByIdLock.Unlock()
 
-	m.intermediateFilesByPartitionKeyLock.Lock()
 	for partitionKey, outputFilename := range args.IntermediateFilesByPartitionKey {
 		outputFilenames := m.intermediateFilesByPartitionKey[partitionKey]
 
@@ -89,9 +89,9 @@ func (m *Master) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) 
 
 		m.intermediateFilesByPartitionKey[partitionKey] = append(outputFilenames, outputFilename)
 	}
-	m.intermediateFilesByPartitionKeyLock.Unlock()
 
 	log.Printf("Serving CompleteTask reply %#v\n", reply)
+	m.cond.Broadcast()
 	return nil
 }
 
@@ -113,44 +113,34 @@ func (m *Master) server() {
 
 func (m *Master) main() {
 	// Map phase
-	m.tasksByIdLock.Lock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := 0; i < len(m.inputFiles); i++ {
 		// Create map tasks for each of the input files
 		taskId := fmt.Sprintf("m%v", i)
 		task := Task{taskType: TaskTypeMap, state: stateIdle, taskId: taskId, inputKeys: []string{m.inputFiles[i]}}
 		m.tasksById[taskId] = &task
 	}
-	m.tasksByIdLock.Unlock()
-	for {
-		if m.isTasksDone() {
-			m.isMapDone = true
-			break
-		}
-		time.Sleep(time.Second)
+	for !m.isTasksDone() {
+		m.cond.Wait()
 	}
+	m.isMapDone = true
 	// Reduce phase
-	m.tasksByIdLock.Lock()
-	m.intermediateFilesByPartitionKeyLock.Lock()
 	for key, outputFilenames := range m.intermediateFilesByPartitionKey {
 		taskId := fmt.Sprintf("r%v", key)
 		task := Task{taskType: TaskTypeReduce, state: stateIdle, taskId: taskId, inputKeys: outputFilenames}
 		m.tasksById[taskId] = &task
 	}
-	m.intermediateFilesByPartitionKeyLock.Unlock()
-	m.tasksByIdLock.Unlock()
 
-	for {
-		if m.isTasksDone() {
-			m.isReduceDone = true
-			break
-		}
-		time.Sleep(time.Second)
+	for !m.isTasksDone() {
+		m.cond.Wait()
 	}
+	m.isReduceDone = true
 }
 
 func (m *Master) cleanUpStaleTasks() {
 	for {
-		m.tasksByIdLock.Lock()
+		m.mu.Lock()
 		for _, task := range m.tasksById {
 			if task.workerId == "" || task.state != stateInProgress {
 				continue
@@ -162,14 +152,14 @@ func (m *Master) cleanUpStaleTasks() {
 				task.workerId = ""
 			}
 		}
-		m.tasksByIdLock.Unlock()
+		m.mu.Unlock()
 		time.Sleep(time.Second)
 	}
 }
 
+
+// Assumes the lock is held
 func (m *Master) isTasksDone() bool {
-	m.tasksByIdLock.Lock()
-	defer m.tasksByIdLock.Unlock()
 	for _, task := range m.tasksById {
 		if task.state != stateComplete {
 			return false
@@ -195,9 +185,9 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.isMapDone = false
 	m.isReduceDone = false
 	m.tasksById = make(map[string]*Task)
-	m.tasksByIdLock = sync.Mutex{}
+	m.mu = sync.Mutex{}
+	m.cond = *sync.NewCond(&m.mu)
 	m.intermediateFilesByPartitionKey = make(map[string][]string)
-	m.intermediateFilesByPartitionKeyLock = sync.Mutex{}
 	m.server()
 	return &m
 }
