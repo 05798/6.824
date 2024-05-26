@@ -94,17 +94,19 @@ type Raft struct {
 	timeout               time.Duration
 }
 
+func (rf *Raft) sleep() {
+	time.Sleep(10 * time.Millisecond)
+}
+
 func (rf *Raft) monitorTimeout() {
 	for {
-		rf.mu.Lock()
 		isExpired := rf.isTimeoutExpired()
-		rf.mu.Unlock()
 		if isExpired {
 			rf.log("monitorTimeout -- converting to candidate")
 			rf.status = StatusCandidate
 			rf.callElection()
 		}
-		time.Sleep(10 * time.Millisecond)
+		rf.sleep()
 	}
 }
 
@@ -116,19 +118,37 @@ func (rf *Raft) streamEntries() {
 		if status == StatusLeader {
 			rf.doAppendEntries()
 		}
-		time.Sleep(10 * time.Millisecond)
+		rf.sleep()
 	}
+}
 
+func (rf *Raft) streamApplyMsg() {
+	for {
+		messages := []ApplyMsg{}
+		rf.mu.Lock()
+		for i := rf.volatileState.lastApplied + 1; i <= rf.volatileState.commitIndex; i++ {
+			log := rf.getLogAtIndex(i)
+			messages = append(messages, ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i})
+		}
+		rf.mu.Unlock()
+
+		for _, message := range(messages) {
+			rf.applyCh <- message
+		}
+
+		rf.mu.Lock()
+		rf.volatileState.lastApplied = rf.volatileState.commitIndex
+		rf.mu.Unlock()
+
+
+		rf.sleep()
+	}
 }
 
 func (rf *Raft) isTimeoutExpired() bool {
-	return time.Now().UTC().After(rf.lastLeaderMessageTime.Add(rf.timeout))
-}
-
-func (rf *Raft) isTimeoutExpiredWithLocks() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.isTimeoutExpired()
+	return time.Now().UTC().After(rf.lastLeaderMessageTime.Add(rf.timeout))
 }
 
 func (rf *Raft) callElection() {
@@ -171,7 +191,7 @@ func (rf *Raft) callElection() {
 	}
 
 	electionMu.Lock()
-	for voteCount < majorityCount && (replyCount-voteCount) <= majorityCount && !rf.isTimeoutExpiredWithLocks() {
+	for voteCount < majorityCount && (replyCount-voteCount) <= majorityCount && !rf.isTimeoutExpired() {
 		electionCond.Wait()
 	}
 	electionMu.Unlock()
@@ -262,15 +282,14 @@ func (rf *Raft) doAppendEntries() {
 		appendCond.Wait()
 	}
 	appendMu.Unlock()
-	rf.mu.Lock()
 	rf.updateLeaderCommitIndex()
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) updateLeaderCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	totalCount := len(rf.peers)
 	majorityCount := (totalCount + 1) / 2
-	var N int
 	for n := rf.volatileState.commitIndex + 1; ; n++ {
 		count := 1
 		for peer, matchIndex := range rf.volatileState.matchIndex {
@@ -282,15 +301,10 @@ func (rf *Raft) updateLeaderCommitIndex() {
 			}
 		}
 		if count < majorityCount {
-			N = n - 1
+			rf.volatileState.commitIndex = n - 1
 			break
 		}
 	}
-	for i := rf.volatileState.commitIndex + 1; i <= N; i++ {
-		log := rf.getLogAtIndex(i)
-		rf.applyCh <- ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i}
-	}
-	rf.volatileState.commitIndex = N
 }
 
 // return currentTerm and whether this server
@@ -424,12 +438,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.spliceLogsAtIndex(args.PrevLogIndex+1, args.Entries)
 	if args.LeaderCommit > rf.volatileState.commitIndex {
-		newCommitIndex := min(args.LeaderCommit, rf.getLastLogIndex())
-		for i := rf.volatileState.commitIndex + 1; i <= newCommitIndex; i++ {
-			log := rf.getLogAtIndex(i)
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i}
-		}
-		rf.volatileState.commitIndex = newCommitIndex
+		rf.volatileState.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 	}
 	rf.lastLeaderMessageTime = time.Now().UTC()
 	reply.Term = rf.persistentState.currentTerm
@@ -555,6 +564,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.streamEntries()
+	go rf.streamApplyMsg()
 	go rf.monitorTimeout()
 
 	return rf
