@@ -18,17 +18,17 @@ package raft
 //
 
 import (
+	// "io"
+	"6.824/labrpc"
 	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-	"io"
-	"6.824/labrpc"
 )
 
 // import "bytes"
-// import "../labgob"
+// import "6.824/labgob"
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -56,9 +56,22 @@ const (
 	timeoutRangeMillis = 300
 )
 
+type Log struct {
+	Command interface{}
+	Term    int
+}
+
 type PersistentState struct {
 	currentTerm int
 	votedFor    int // -1 if uninitialized
+	log         []Log
+}
+
+type VolatileState struct {
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // A Go object implementing a single Raft peer.
@@ -68,11 +81,13 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	persistentState *PersistentState
+	volatileState   *VolatileState
 	status          int
 
 	lastLeaderMessageTime time.Time
@@ -94,6 +109,7 @@ func (rf *Raft) main() {
 		default:
 			log.Fatal("Unknown status")
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 }
@@ -102,10 +118,9 @@ func (rf *Raft) handleFollower() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.isTimeoutExpired() {
-		log.Printf("%v %v %#v handleFollower -- converting to candidate", rf.me, rf.status, rf.persistentState)
+		rf.log("handleFollower -- converting to candidate")
 		rf.status = StatusCandidate
 	}
-	time.Sleep(10 * time.Millisecond)
 }
 
 func (rf *Raft) isTimeoutExpired() bool {
@@ -119,7 +134,6 @@ func (rf *Raft) isTimeoutExpiredWithLocks() bool {
 }
 
 func (rf *Raft) handleCandidate() {
-	log.Printf("%v %v %#v handleCandidate -- calling an election", rf.me, rf.status, rf.persistentState)
 	rf.callElection()
 }
 
@@ -143,19 +157,19 @@ func (rf *Raft) callElection() {
 		}
 		go func(peer int) {
 			rf.mu.Lock()
-			log.Printf("%v %v %#v callElection -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
 			args := RequestVoteArgs{Term: rf.persistentState.currentTerm, CandidateId: rf.me}
 			reply := RequestVoteReply{}
+			rf.log("callElection -- sending request %#v to %v", args, peer)
 			rf.mu.Unlock()
 			success := rf.sendRequestVote(peer, &args, &reply)
 			electionMu.Lock()
 			defer electionMu.Unlock()
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			log.Printf("%v %v %#v callElection -- received response from %v", rf.me, rf.status, rf.persistentState, peer)
+			rf.log("callElection -- received response %#v from %v", reply, peer)
 			replyCount += 1
 			if success && reply.VoteGranted {
-				log.Printf("%v %v %#v callElection -- received vote from %v", rf.me, rf.status, rf.persistentState, peer)
+				// What happens if I see a greater term number?
 				voteCount += 1
 			}
 			electionCond.Broadcast()
@@ -168,33 +182,126 @@ func (rf *Raft) callElection() {
 	}
 	electionMu.Unlock()
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if voteCount >= majorityCount {
-		log.Printf("%v %v %#v callElection -- won the election with %v votes", rf.me, rf.status, rf.persistentState, voteCount)
+		rf.log("callElection -- won the election with %v votes", voteCount)
 		rf.status = StatusLeader
 		rf.lastLeaderMessageTime = time.Now().UTC()
+		rf.initialiseNextIndex()
+		rf.initialiseMatchIndex()
+		rf.mu.Unlock()
+		rf.doAppendEntries()
+	} else {
+		rf.log("callElection -- lost the election with %v votes", voteCount)
+		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) handleLeader() {
+	rf.doAppendEntries()
+	time.Sleep(10 * time.Millisecond)
+}
+
+func (rf *Raft) doAppendEntries() {
+	rf.mu.Lock()
 	totalCount := len(rf.peers)
+	rf.mu.Unlock()
+
+	appendMu := sync.Mutex{}
+	appendCond := sync.NewCond(&appendMu)
+	successCount := 1
+	replyCount := 1
+	majorityCount := (totalCount + 1) / 2
 	for i := 0; i < totalCount; i++ {
 		if i == rf.me {
 			continue
 		}
 		go func(peer int) {
 			rf.mu.Lock()
-			log.Printf("%v %v %#v handleLeader -- sending request to %v", rf.me, rf.status, rf.persistentState, peer)
-			args := AppendEntriesArgs{Term: rf.persistentState.currentTerm, LeaderId: rf.me}
+			prevLogIndex := rf.volatileState.nextIndex[peer] - 1
+			var prevLogTerm int
+			if prevLogIndex < 1 {
+				prevLogTerm = 0
+			} else {
+				prevLogTerm = rf.getLogAtIndex(prevLogIndex).Term
+			}
+			entries := rf.getLogsSuffixFromIndex(prevLogIndex + 1)
+			args := AppendEntriesArgs{
+				Term:         rf.persistentState.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.volatileState.commitIndex,
+			}
 			reply := AppendEntriesReply{}
 			rf.mu.Unlock()
-			rf.sendAppendEntries(peer, &args, &reply)
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			log.Printf("%v %v %#v handleLeader -- received response from %v", rf.me, rf.status, rf.persistentState, peer)
+			for {
+				// Do I need to check whether I'm still a leader when checking the responses
+				rf.log("handleLeader -- sending request %#v to peer %v", args, peer)
+				success := rf.sendAppendEntries(peer, &args, &reply)
+				rf.log("handleLeader -- received response %#v from peer %v", reply, peer)
+				if success {
+					appendMu.Lock()
+					defer appendMu.Unlock()
+					defer appendCond.Broadcast()
+					replyCount += 1
+					rf.mu.Lock()
+					if reply.Term > rf.persistentState.currentTerm {
+						rf.status = StatusFollower
+						rf.mu.Unlock()
+						break
+					}
+					if reply.Success {
+						index := prevLogIndex + len(entries) + 1
+						rf.log("handleLeader -- updating nextIndex to %v and matchIndex to %v for peer %v", index, index - 1, peer)
+						rf.volatileState.nextIndex[peer] = index
+						rf.volatileState.matchIndex[peer] = index - 1
+						successCount += 1
+					} else if rf.volatileState.nextIndex[peer] > 1 {
+						rf.log("handleLeader -- decrementing nextIndex for peer %v", peer)
+						rf.volatileState.nextIndex[peer] -= 1
+					}
+					rf.mu.Unlock()
+					break
+				}
+			}
 		}(i)
 	}
-	time.Sleep(10 * time.Millisecond)
+
+	appendMu.Lock()
+	for successCount < majorityCount && (replyCount-successCount) <= majorityCount {
+		appendCond.Wait()
+	}
+	appendMu.Unlock()
+	rf.mu.Lock()
+	rf.updateLeaderCommitIndex()
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) updateLeaderCommitIndex() {
+	totalCount := len(rf.peers)
+	majorityCount := (totalCount + 1) / 2
+	var N int
+	for n := rf.volatileState.commitIndex + 1; ; n++ {
+		count := 1
+		for peer, matchIndex := range rf.volatileState.matchIndex {
+			if peer == rf.me {
+				continue
+			}
+			if matchIndex >= n {
+				count++
+			}
+		}
+		if count < majorityCount {
+			N = n - 1
+			break
+		}
+	}
+	for i := rf.volatileState.commitIndex + 1; i <= N; i++ {
+		log := rf.getLogAtIndex(i)
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i}
+	}
+	rf.volatileState.commitIndex = N
 }
 
 // return currentTerm and whether this server
@@ -258,11 +365,10 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	log.Printf("%v %v %#v RequestVote -- received args %#v", rf.me, rf.status, rf.persistentState, args)
-	defer log.Printf("%v %v %#v RequestVote -- responding with reply %#v", rf.me, rf.status, rf.persistentState, reply)
+	rf.log("RequestVote -- received request %#v", args)
 	defer rf.mu.Unlock()
 	if args.Term > rf.persistentState.currentTerm {
-		log.Printf("%v %v %#v RequestVote -- setting term to %v", rf.me, rf.status, rf.persistentState, args.Term)
+		rf.log("RequestVote -- setting term to %v", args.Term)
 		rf.persistentState.currentTerm = args.Term
 		rf.persistentState.votedFor = -1
 		rf.status = StatusFollower
@@ -270,25 +376,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.CurrentTerm = rf.persistentState.currentTerm
 	reply.VoteGranted = false
 	if args.Term < rf.persistentState.currentTerm {
-		log.Printf("%v %v %#v RequestVote -- discarding request from candidate %v due to lesser term %v but currently on %v", rf.me, rf.status, rf.persistentState, args.CandidateId, args.Term, rf.persistentState.currentTerm)
+		rf.log("RequestVote -- responding with response %#v (request term out of date)", reply)
 		return
 	}
 	if rf.status != StatusFollower {
-		log.Printf("%v %v %#v RequestVote -- discarding request from candidate %v on term %v since no longer follower", rf.me, rf.status, rf.persistentState, args.CandidateId, rf.persistentState.currentTerm)
+		rf.log("RequestVote -- responding with response %#v (not a follower)", reply)
 		return
 	}
 	if rf.persistentState.votedFor >= 0 && rf.persistentState.votedFor != args.CandidateId {
-		log.Printf("%v %v %#v RequestVote -- not voting for candidate %v on term %v since already voted for %v", rf.me, rf.status, rf.persistentState, args.CandidateId, rf.persistentState.currentTerm, rf.persistentState.votedFor)
+		rf.log("RequestVote -- responding with response %#v (already voted for %v)", reply, rf.persistentState.votedFor)
 		return
 	}
 	rf.persistentState.votedFor = args.CandidateId
 	reply.VoteGranted = true
-	log.Printf("%v %v %#v RequestVote -- voting for %v on term %v", rf.me, rf.status, rf.persistentState, args.CandidateId, args.Term)
+	rf.log("RequestVote -- responding with response %#v (vote granted)", reply)
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -298,11 +408,10 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	log.Printf("%v %v %#v AppendEntries -- received args %#v", rf.me, rf.status, rf.persistentState, args)
-	defer log.Printf("%v %v %#v AppendEntries -- responding with reply %#v", rf.me, rf.status, rf.persistentState, reply)
+	rf.log("AppendEntries-- received request %#v", args)
 	defer rf.mu.Unlock()
 	if args.Term > rf.persistentState.currentTerm {
-		log.Printf("%v %v %#v AppendEntries -- setting term to %v", rf.me, rf.status, rf.persistentState, args.Term)
+		rf.log("AppendEntries -- setting term to %v", args.Term)
 		rf.persistentState.currentTerm = args.Term
 		rf.persistentState.votedFor = -1
 		rf.status = StatusFollower
@@ -310,13 +419,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.persistentState.currentTerm
 	reply.Success = false
 	if args.Term < rf.persistentState.currentTerm {
-		log.Printf("%v %v %#v AppendEntries -- discarding request from leader %v due to lesser term %v but currently on %v", rf.me, rf.status, rf.persistentState, args.LeaderId, args.Term, rf.persistentState.currentTerm)
+		rf.log("AppendEntries -- responding with response %#v (request term out of date)", reply)
 		return
+	}
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		rf.log("AppendEntries -- responding with response %#v (no log at PrevLogIndex %v)", reply, args.PrevLogIndex)
+		return
+	}
+	if args.PrevLogIndex > 0 {
+		prevLog := rf.getLogAtIndex(args.PrevLogIndex)
+		if prevLog.Term != args.PrevLogTerm {
+			rf.log("AppendEntries -- responding with response %#v (inconsistent log entry %#v at PrevLogIndex %v)", reply, prevLog, args.PrevLogIndex)
+			return
+		}
+	}
+	rf.spliceLogsAtIndex(args.PrevLogIndex+1, args.Entries)
+	if args.LeaderCommit > rf.volatileState.commitIndex {
+		newCommitIndex := min(args.LeaderCommit, rf.getLastLogIndex())
+		for i := rf.volatileState.commitIndex + 1; i <= newCommitIndex; i++ {
+			log := rf.getLogAtIndex(i)
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i}
+		}
+		rf.volatileState.commitIndex = newCommitIndex
 	}
 	rf.lastLeaderMessageTime = time.Now().UTC()
 	reply.Term = rf.persistentState.currentTerm
 	reply.Success = true
-	log.Printf("%v %v %#v AppendEntires -- appending entries from leader %v on term %v", rf.me, rf.status, rf.persistentState, args.LeaderId, rf.persistentState.currentTerm)
+	rf.log("AppendEntries -- responding with response %#v (successfully appended logs)", reply)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -369,11 +498,18 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := rf.getLastLogIndex() + 1
+	term := rf.persistentState.currentTerm
+	isLeader := rf.status == StatusLeader
 
-	// Your code here (2B).
+	if isLeader {
+		logs := []Log{{Term: term, Command: command}}
+		rf.log("Start -- received command %#v", command)
+		rf.spliceLogsAtIndex(index, logs)
+		rf.log("Start -- responding with %v %v %v", index, term, isLeader)
+	}
 
 	return index, term, isLeader
 }
@@ -408,16 +544,20 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	log.SetOutput(io.Discard)
+	// log.SetOutput(io.Discard)
+	peerCount := len(peers)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	persistentState := PersistentState{currentTerm: 0, votedFor: -1}
+	persistentState := PersistentState{currentTerm: 0, votedFor: -1, log: make([]Log, 0)}
 	rf.persistentState = &persistentState
+	volatileState := VolatileState{commitIndex: 0, lastApplied: 0, nextIndex: make([]int, peerCount), matchIndex: make([]int, peerCount)}
+	rf.volatileState = &volatileState
 	rf.status = StatusFollower
+	rf.applyCh = applyCh
 
 	rf.lastLeaderMessageTime = time.Now().UTC()
 	rf.timeout = time.Duration(minTimeoutMillis+rand.Intn(timeoutRangeMillis)) * time.Millisecond
