@@ -67,3 +67,12 @@ func (rf *Raft) spliceLogsAtIndex(firstIndex int, logs []Log) {
 func (rf *Raft) getLastLogIndex() int {
 	return len(rf.persistentState.log)
 }
+
+func (rf *Raft) getFirstIndexWithTerm(term int) int {
+	for i, log := range rf.persistentState.log {
+		if log.Term == term {
+			return i + 1
+		}
+	}
+	return 0
+}

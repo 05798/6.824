@@ -18,9 +18,9 @@ package raft
 //
 
 import (
-	"log"
-	"io"
 	"6.824/labrpc"
+	"io"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -52,8 +52,8 @@ const (
 )
 
 const (
-	minTimeoutMillis   = 300
-	timeoutRangeMillis = 300
+	minTimeoutMillis   = 500
+	timeoutRangeMillis = 500
 )
 
 type Log struct {
@@ -95,13 +95,13 @@ type Raft struct {
 }
 
 func (rf *Raft) sleep() {
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 }
 
 func (rf *Raft) monitorTimeout() {
 	for {
 		isExpired := rf.isTimeoutExpired()
-		if isExpired {
+		if isExpired && !rf.isLeader() {
 			rf.log("monitorTimeout -- converting to candidate")
 			rf.status = StatusCandidate
 			rf.callElection()
@@ -126,23 +126,30 @@ func (rf *Raft) streamApplyMsg() {
 	for {
 		messages := []ApplyMsg{}
 		rf.mu.Lock()
+		newLastApplied := rf.volatileState.commitIndex
 		for i := rf.volatileState.lastApplied + 1; i <= rf.volatileState.commitIndex; i++ {
+			rf.log("streamApplyMsg - sending index at %v with lastApplied %v and commitIndex %v", i, rf.volatileState.lastApplied, rf.volatileState.commitIndex)
 			log := rf.getLogAtIndex(i)
 			messages = append(messages, ApplyMsg{CommandValid: true, Command: log.Command, CommandIndex: i})
 		}
 		rf.mu.Unlock()
 
-		for _, message := range(messages) {
+		for _, message := range messages {
 			rf.applyCh <- message
 		}
 
 		rf.mu.Lock()
-		rf.volatileState.lastApplied = rf.volatileState.commitIndex
+		rf.volatileState.lastApplied = newLastApplied
 		rf.mu.Unlock()
-
 
 		rf.sleep()
 	}
+}
+
+func (rf *Raft) isLeader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.status == StatusLeader
 }
 
 func (rf *Raft) isTimeoutExpired() bool {
@@ -171,7 +178,12 @@ func (rf *Raft) callElection() {
 		}
 		go func(peer int) {
 			rf.mu.Lock()
-			args := RequestVoteArgs{Term: rf.persistentState.currentTerm, CandidateId: rf.me}
+			lastLogIndex := rf.getLastLogIndex()
+			lastLogTerm := 0
+			if lastLogIndex > 0 {
+				lastLogTerm = rf.getLogAtIndex(lastLogIndex).Term
+			} 
+			args := RequestVoteArgs{Term: rf.persistentState.currentTerm, CandidateId: rf.me, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
 			reply := RequestVoteReply{}
 			rf.log("callElection -- sending request %#v to %v", args, peer)
 			rf.mu.Unlock()
@@ -180,11 +192,15 @@ func (rf *Raft) callElection() {
 			defer electionMu.Unlock()
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			rf.log("callElection -- received response %#v from %v", reply, peer)
 			replyCount += 1
-			if success && reply.VoteGranted {
-				// What happens if I see a greater term number?
-				voteCount += 1
+			if success && rf.status == StatusCandidate {
+				rf.log("callElection -- received response %#v from %v", reply, peer)
+				if reply.VoteGranted {
+					voteCount += 1
+				} else if reply.CurrentTerm > rf.persistentState.currentTerm {
+					rf.persistentState.currentTerm = reply.CurrentTerm
+					rf.status = StatusFollower
+				}
 			}
 			electionCond.Broadcast()
 		}(i)
@@ -196,6 +212,10 @@ func (rf *Raft) callElection() {
 	}
 	electionMu.Unlock()
 	rf.mu.Lock()
+	if rf.status != StatusCandidate {
+		rf.mu.Unlock()
+		return
+	}
 	if voteCount >= majorityCount {
 		rf.log("callElection -- won the election with %v votes", voteCount)
 		rf.status = StatusLeader
@@ -225,31 +245,30 @@ func (rf *Raft) doAppendEntries() {
 			continue
 		}
 		go func(peer int) {
-			rf.mu.Lock()
-			prevLogIndex := rf.volatileState.nextIndex[peer] - 1
-			var prevLogTerm int
-			if prevLogIndex < 1 {
-				prevLogTerm = 0
-			} else {
-				prevLogTerm = rf.getLogAtIndex(prevLogIndex).Term
-			}
-			entries := rf.getLogsSuffixFromIndex(prevLogIndex + 1)
-			args := AppendEntriesArgs{
-				Term:         rf.persistentState.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: rf.volatileState.commitIndex,
-			}
-			reply := AppendEntriesReply{}
-			rf.mu.Unlock()
-			for {
-				// Do I need to check whether I'm still a leader when checking the responses
-				rf.log("handleLeader -- sending request %#v to peer %v", args, peer)
+			for rf.isLeader() {
+				rf.mu.Lock()
+				prevLogIndex := rf.volatileState.nextIndex[peer] - 1
+				var prevLogTerm int
+				if prevLogIndex < 1 {
+					prevLogTerm = 0
+				} else {
+					prevLogTerm = rf.getLogAtIndex(prevLogIndex).Term
+				}
+				entries := rf.getLogsSuffixFromIndex(prevLogIndex + 1)
+				args := AppendEntriesArgs{
+					Term:         rf.persistentState.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: rf.volatileState.commitIndex,
+				}
+				reply := AppendEntriesReply{}
+				rf.mu.Unlock()
+				rf.log("doAppendEntries -- sending request %#v to peer %v", args, peer)
 				success := rf.sendAppendEntries(peer, &args, &reply)
-				rf.log("handleLeader -- received response %#v from peer %v", reply, peer)
-				if success {
+				if success && rf.isLeader() {
+					rf.log("doAppendEntries -- received response %#v from peer %v", reply, peer)
 					appendMu.Lock()
 					defer appendMu.Unlock()
 					defer appendCond.Broadcast()
@@ -257,18 +276,18 @@ func (rf *Raft) doAppendEntries() {
 					rf.mu.Lock()
 					if reply.Term > rf.persistentState.currentTerm {
 						rf.status = StatusFollower
+						rf.persistentState.currentTerm = reply.Term
 						rf.mu.Unlock()
 						break
 					}
 					if reply.Success {
 						index := prevLogIndex + len(entries) + 1
-						rf.log("handleLeader -- updating nextIndex to %v and matchIndex to %v for peer %v", index, index - 1, peer)
+						rf.log("doAppendEntries -- updating nextIndex to %v and matchIndex to %v for peer %v", index, index-1, peer)
 						rf.volatileState.nextIndex[peer] = index
 						rf.volatileState.matchIndex[peer] = index - 1
 						successCount += 1
-					} else if rf.volatileState.nextIndex[peer] > 1 {
-						rf.log("handleLeader -- decrementing nextIndex for peer %v", peer)
-						rf.volatileState.nextIndex[peer] -= 1
+					} else {
+						rf.volatileState.nextIndex[peer] = max(1, reply.FirstConflictTermIndex)
 					}
 					rf.mu.Unlock()
 					break
@@ -282,6 +301,12 @@ func (rf *Raft) doAppendEntries() {
 		appendCond.Wait()
 	}
 	appendMu.Unlock()
+	rf.mu.Lock()
+	if rf.status != StatusLeader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
 	rf.updateLeaderCommitIndex()
 }
 
@@ -301,6 +326,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 			}
 		}
 		if count < majorityCount {
+			rf.log("updateLeaderCommitIndex -- setting leader commit to %v", n-1)
 			rf.volatileState.commitIndex = n - 1
 			break
 		}
@@ -355,7 +381,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateId int
-	// TODO log fields
+	LastLogIndex int
+	LastLogTerm int
 }
 
 // example RequestVote RPC reply structure.
@@ -390,6 +417,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.log("RequestVote -- responding with response %#v (already voted for %v)", reply, rf.persistentState.votedFor)
 		return
 	}
+	lastLogIndex := rf.getLastLogIndex()
+	if lastLogIndex > 0 {
+		lastLogTerm := rf.getLogAtIndex(lastLogIndex).Term
+		if lastLogTerm > args.LastLogTerm {
+			rf.log("RequestVote -- responding with response %#v (have lastLogTerm %v)", reply, lastLogTerm)
+			return
+		}
+		if lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex {
+			rf.log("RequestVote -- responding with response %#v (have lastLogIndex %v)", reply, lastLogIndex)
+			return
+		}
+	}
 	rf.persistentState.votedFor = args.CandidateId
 	reply.VoteGranted = true
 	rf.log("RequestVote -- responding with response %#v (vote granted)", reply)
@@ -405,8 +444,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	FirstConflictTermIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -425,6 +466,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log("AppendEntries -- responding with response %#v (request term out of date)", reply)
 		return
 	}
+	rf.lastLeaderMessageTime = time.Now().UTC()
 	if args.PrevLogIndex > rf.getLastLogIndex() {
 		rf.log("AppendEntries -- responding with response %#v (no log at PrevLogIndex %v)", reply, args.PrevLogIndex)
 		return
@@ -433,6 +475,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		prevLog := rf.getLogAtIndex(args.PrevLogIndex)
 		if prevLog.Term != args.PrevLogTerm {
 			rf.log("AppendEntries -- responding with response %#v (inconsistent log entry %#v at PrevLogIndex %v)", reply, prevLog, args.PrevLogIndex)
+			reply.ConflictTerm = prevLog.Term
+			reply.FirstConflictTermIndex = rf.getFirstIndexWithTerm(prevLog.Term)
 			return
 		}
 	}
@@ -440,7 +484,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.volatileState.commitIndex {
 		rf.volatileState.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 	}
-	rf.lastLeaderMessageTime = time.Now().UTC()
 	reply.Term = rf.persistentState.currentTerm
 	reply.Success = true
 	rf.log("AppendEntries -- responding with response %#v (successfully appended logs)", reply)
