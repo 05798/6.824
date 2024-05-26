@@ -18,9 +18,9 @@ package raft
 //
 
 import (
-	// "io"
-	"6.824/labrpc"
 	"log"
+	"io"
+	"6.824/labrpc"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -94,33 +94,31 @@ type Raft struct {
 	timeout               time.Duration
 }
 
-func (rf *Raft) main() {
+func (rf *Raft) monitorTimeout() {
+	for {
+		rf.mu.Lock()
+		isExpired := rf.isTimeoutExpired()
+		rf.mu.Unlock()
+		if isExpired {
+			rf.log("monitorTimeout -- converting to candidate")
+			rf.status = StatusCandidate
+			rf.callElection()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) streamEntries() {
 	for {
 		rf.mu.Lock()
 		status := rf.status
 		rf.mu.Unlock()
-		switch status {
-		case StatusFollower:
-			rf.handleFollower()
-		case StatusCandidate:
-			rf.handleCandidate()
-		case StatusLeader:
-			rf.handleLeader()
-		default:
-			log.Fatal("Unknown status")
+		if status == StatusLeader {
+			rf.doAppendEntries()
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-}
-
-func (rf *Raft) handleFollower() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.isTimeoutExpired() {
-		rf.log("handleFollower -- converting to candidate")
-		rf.status = StatusCandidate
-	}
 }
 
 func (rf *Raft) isTimeoutExpired() bool {
@@ -131,10 +129,6 @@ func (rf *Raft) isTimeoutExpiredWithLocks() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.isTimeoutExpired()
-}
-
-func (rf *Raft) handleCandidate() {
-	rf.callElection()
 }
 
 func (rf *Raft) callElection() {
@@ -194,11 +188,6 @@ func (rf *Raft) callElection() {
 		rf.log("callElection -- lost the election with %v votes", voteCount)
 		rf.mu.Unlock()
 	}
-}
-
-func (rf *Raft) handleLeader() {
-	rf.doAppendEntries()
-	time.Sleep(10 * time.Millisecond)
 }
 
 func (rf *Raft) doAppendEntries() {
@@ -544,7 +533,7 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	// log.SetOutput(io.Discard)
+	log.SetOutput(io.Discard)
 	peerCount := len(peers)
 	rf := &Raft{}
 	rf.peers = peers
@@ -565,7 +554,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.main()
+	go rf.streamEntries()
+	go rf.monitorTimeout()
 
 	return rf
 }
