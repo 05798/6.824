@@ -44,3 +44,11 @@ Correctness:
     - Execution history is linearizable if there is a total order of operations 
         that matches realtime for non-concurrent requests AND
     - Each read sees the most recent write according to that order
+- Linearizable ~ strongly consistent
+- If a system is linearizable, all clients will agree on the order of the write operations
+Retries
+- If a client retries a request, the server must serve up the response to the first request
+- This is done by keeping the original response and associating with the original request's identifier
+- Client retries can be interpreted as a separate request or as a continuation of the original request
+    - This can make the linearizability of a system dependent upon whether you count the number of requests from 
+        the perspective of the application or the transport layer
