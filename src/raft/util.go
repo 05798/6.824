@@ -1,8 +1,8 @@
 package raft
 
 import (
-	"log"
 	"fmt"
+	"log"
 )
 
 // Debugging
@@ -16,22 +16,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func toStatusString(status int) string {
-	switch (status) {
-		case StatusFollower: 
-			return "Follower"
-		case StatusCandidate: 
-			return "Candidate"
-		case StatusLeader:
-			return "Leader"
-		default: 
-			log.Fatalf("Unknown status")
-			return ""
+	switch status {
+	case StatusFollower:
+		return "Follower"
+	case StatusCandidate:
+		return "Candidate"
+	case StatusLeader:
+		return "Leader"
+	default:
+		log.Fatalf("Unknown status")
+		return ""
 	}
 }
 
 func (rf *Raft) log(formatSpecifier string, args ...interface{}) {
 	status := toStatusString(rf.status)
-	raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, status, rf.persistentState.currentTerm)
+	raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, status, rf.persistentState.CurrentTerm)
 	insertedLog := fmt.Sprintf(formatSpecifier, args...)
 	log.Printf("|| %v || %v", raftState, insertedLog)
 }
@@ -51,25 +51,26 @@ func (rf *Raft) initialiseMatchIndex() {
 
 func (rf *Raft) getLogAtIndex(index int) Log {
 	// Indexes are 1 based unfortunately
-	return rf.persistentState.log[index-1]
+	return rf.persistentState.Log[index-1]
 }
 
 func (rf *Raft) getLogsSuffixFromIndex(index int) []Log {
-	return rf.persistentState.log[index-1:]
+	return rf.persistentState.Log[index-1:]
 }
 
 func (rf *Raft) spliceLogsAtIndex(firstIndex int, logs []Log) {
 	rf.log("spliceLogsAtIndex with %#v from first index %v", logs, firstIndex)
-	rf.persistentState.log = append(rf.persistentState.log[:firstIndex-1], logs...)
-	rf.log("spliceLogsAtIndex %#v", rf.persistentState.log)
+	rf.persistentState.Log = append(rf.persistentState.Log[:firstIndex-1], logs...)
+	rf.persist()
+	rf.log("spliceLogsAtIndex %#v", rf.persistentState.Log)
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.persistentState.log)
+	return len(rf.persistentState.Log)
 }
 
 func (rf *Raft) getFirstIndexWithTerm(term int) int {
-	for i, log := range rf.persistentState.log {
+	for i, log := range rf.persistentState.Log {
 		if log.Term == term {
 			return i + 1
 		}

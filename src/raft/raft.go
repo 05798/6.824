@@ -18,9 +18,14 @@ package raft
 //
 
 import (
-	"6.824/labrpc"
-	"io"
+	"bytes"
 	"log"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+
+	// "io"
+	// "log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -62,9 +67,9 @@ type Log struct {
 }
 
 type PersistentState struct {
-	currentTerm int
-	votedFor    int // -1 if uninitialized
-	log         []Log
+	CurrentTerm int
+	VotedFor    int // -1 if uninitialized
+	Log         []Log
 }
 
 type VolatileState struct {
@@ -160,7 +165,7 @@ func (rf *Raft) isTimeoutExpired() bool {
 
 func (rf *Raft) callElection() {
 	rf.mu.Lock()
-	rf.persistentState.currentTerm += 1
+	rf.persistentState.CurrentTerm += 1
 	rf.lastLeaderMessageTime = time.Now().UTC()
 
 	electionMu := sync.Mutex{}
@@ -182,8 +187,8 @@ func (rf *Raft) callElection() {
 			lastLogTerm := 0
 			if lastLogIndex > 0 {
 				lastLogTerm = rf.getLogAtIndex(lastLogIndex).Term
-			} 
-			args := RequestVoteArgs{Term: rf.persistentState.currentTerm, CandidateId: rf.me, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
+			}
+			args := RequestVoteArgs{Term: rf.persistentState.CurrentTerm, CandidateId: rf.me, LastLogIndex: lastLogIndex, LastLogTerm: lastLogTerm}
 			reply := RequestVoteReply{}
 			rf.log("callElection -- sending request %#v to %v", args, peer)
 			rf.mu.Unlock()
@@ -197,8 +202,9 @@ func (rf *Raft) callElection() {
 				rf.log("callElection -- received response %#v from %v", reply, peer)
 				if reply.VoteGranted {
 					voteCount += 1
-				} else if reply.CurrentTerm > rf.persistentState.currentTerm {
-					rf.persistentState.currentTerm = reply.CurrentTerm
+				} else if reply.CurrentTerm > rf.persistentState.CurrentTerm {
+					rf.persistentState.CurrentTerm = reply.CurrentTerm
+					rf.persist()
 					rf.status = StatusFollower
 				}
 			}
@@ -256,7 +262,7 @@ func (rf *Raft) doAppendEntries() {
 				}
 				entries := rf.getLogsSuffixFromIndex(prevLogIndex + 1)
 				args := AppendEntriesArgs{
-					Term:         rf.persistentState.currentTerm,
+					Term:         rf.persistentState.CurrentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
@@ -274,9 +280,10 @@ func (rf *Raft) doAppendEntries() {
 					defer appendCond.Broadcast()
 					replyCount += 1
 					rf.mu.Lock()
-					if reply.Term > rf.persistentState.currentTerm {
+					if reply.Term > rf.persistentState.CurrentTerm {
 						rf.status = StatusFollower
-						rf.persistentState.currentTerm = reply.Term
+						rf.persistentState.CurrentTerm = reply.Term
+						rf.persist()
 						rf.mu.Unlock()
 						break
 					}
@@ -338,21 +345,20 @@ func (rf *Raft) updateLeaderCommitIndex() {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persistentState.currentTerm, rf.status == StatusLeader
+	return rf.persistentState.CurrentTerm, rf.status == StatusLeader
 }
 
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// Assumes the lock has been acquired
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.persistentState)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	rf.log("Persisted %#v", rf.persistentState)
 }
 
 // restore previously persisted state.
@@ -360,29 +366,25 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var persistentState PersistentState
+	if d.Decode(&persistentState) != nil {
+		log.Fatal("Error decoding persistent state")
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.persistentState = &persistentState
 }
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
 	LastLogIndex int
-	LastLogTerm int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -397,15 +399,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	rf.log("RequestVote -- received request %#v", args)
 	defer rf.mu.Unlock()
-	if args.Term > rf.persistentState.currentTerm {
+	if args.Term > rf.persistentState.CurrentTerm {
 		rf.log("RequestVote -- setting term to %v", args.Term)
-		rf.persistentState.currentTerm = args.Term
-		rf.persistentState.votedFor = -1
+		rf.persistentState.CurrentTerm = args.Term
+		rf.persistentState.VotedFor = -1
+		rf.persist()
 		rf.status = StatusFollower
 	}
-	reply.CurrentTerm = rf.persistentState.currentTerm
+	reply.CurrentTerm = rf.persistentState.CurrentTerm
 	reply.VoteGranted = false
-	if args.Term < rf.persistentState.currentTerm {
+	if args.Term < rf.persistentState.CurrentTerm {
 		rf.log("RequestVote -- responding with response %#v (request term out of date)", reply)
 		return
 	}
@@ -413,8 +416,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.log("RequestVote -- responding with response %#v (not a follower)", reply)
 		return
 	}
-	if rf.persistentState.votedFor >= 0 && rf.persistentState.votedFor != args.CandidateId {
-		rf.log("RequestVote -- responding with response %#v (already voted for %v)", reply, rf.persistentState.votedFor)
+	if rf.persistentState.VotedFor >= 0 && rf.persistentState.VotedFor != args.CandidateId {
+		rf.log("RequestVote -- responding with response %#v (already voted for %v)", reply, rf.persistentState.VotedFor)
 		return
 	}
 	lastLogIndex := rf.getLastLogIndex()
@@ -429,7 +432,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
-	rf.persistentState.votedFor = args.CandidateId
+	rf.persistentState.VotedFor = args.CandidateId
+	rf.persist()
 	reply.VoteGranted = true
 	rf.log("RequestVote -- responding with response %#v (vote granted)", reply)
 }
@@ -444,9 +448,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term          int
-	Success       bool
-	ConflictTerm  int
+	Term                   int
+	Success                bool
+	ConflictTerm           int
 	FirstConflictTermIndex int
 }
 
@@ -454,15 +458,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	rf.log("AppendEntries-- received request %#v", args)
 	defer rf.mu.Unlock()
-	if args.Term > rf.persistentState.currentTerm {
+	if args.Term > rf.persistentState.CurrentTerm {
 		rf.log("AppendEntries -- setting term to %v", args.Term)
-		rf.persistentState.currentTerm = args.Term
-		rf.persistentState.votedFor = -1
+		rf.persistentState.CurrentTerm = args.Term
+		rf.persistentState.VotedFor = -1
+		rf.persist()
 		rf.status = StatusFollower
 	}
-	reply.Term = rf.persistentState.currentTerm
+	reply.Term = rf.persistentState.CurrentTerm
 	reply.Success = false
-	if args.Term < rf.persistentState.currentTerm {
+	if args.Term < rf.persistentState.CurrentTerm {
 		rf.log("AppendEntries -- responding with response %#v (request term out of date)", reply)
 		return
 	}
@@ -484,7 +489,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.volatileState.commitIndex {
 		rf.volatileState.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 	}
-	reply.Term = rf.persistentState.currentTerm
+	reply.Term = rf.persistentState.CurrentTerm
 	reply.Success = true
 	rf.log("AppendEntries -- responding with response %#v (successfully appended logs)", reply)
 }
@@ -542,7 +547,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	index := rf.getLastLogIndex() + 1
-	term := rf.persistentState.currentTerm
+	term := rf.persistentState.CurrentTerm
 	isLeader := rf.status == StatusLeader
 
 	if isLeader {
@@ -585,7 +590,7 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	log.SetOutput(io.Discard)
+	// log.SetOutput(io.Discard)
 	peerCount := len(peers)
 	rf := &Raft{}
 	rf.peers = peers
@@ -593,7 +598,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	persistentState := PersistentState{currentTerm: 0, votedFor: -1, log: make([]Log, 0)}
+	persistentState := PersistentState{CurrentTerm: 0, VotedFor: -1, Log: make([]Log, 0)}
 	rf.persistentState = &persistentState
 	volatileState := VolatileState{commitIndex: 0, lastApplied: 0, nextIndex: make([]int, peerCount), matchIndex: make([]int, peerCount)}
 	rf.volatileState = &volatileState
