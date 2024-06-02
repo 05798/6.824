@@ -15,7 +15,7 @@
 * Majority is required to progress e.g. elect a leader, commit a log entry
 * There cannot be more than one partition with a majority
 * Majority means majority of all servers -- not just a majority of the live servers
-* 2f + 1 servers can survive f failures
+* `2f + 1` servers can survive `f` failures
 * Any two majorities has a minimum overlap of 1 server
 * For consecutive majorities, this means that information from the previous majority is persisted e.g. Raft term number
 * Paxos and viewstamped replication were early majority vote systems
