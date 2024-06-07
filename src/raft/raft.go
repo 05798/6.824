@@ -50,10 +50,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Status = string
+
 const (
-	StatusLeader    = iota
-	StatusFollower  = iota
-	StatusCandidate = iota
+	Leader    Status = "Leader"
+	Follower  Status = "Follower"
+	Candidate Status = "Candidate"
 )
 
 const (
@@ -93,7 +95,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	persistentState *PersistentState
 	volatileState   *VolatileState
-	status          int
+	status          Status
 
 	lastLeaderMessageTime time.Time
 	timeout               time.Duration
@@ -104,11 +106,11 @@ func (rf *Raft) sleep() {
 }
 
 func (rf *Raft) monitorTimeout() {
-	for {
+	for !rf.killed() {
 		isExpired := rf.isTimeoutExpired()
 		if isExpired && !rf.isLeader() {
 			rf.log("monitorTimeout -- converting to candidate")
-			rf.status = StatusCandidate
+			rf.status = Candidate
 			rf.callElection()
 		}
 		rf.sleep()
@@ -116,11 +118,11 @@ func (rf *Raft) monitorTimeout() {
 }
 
 func (rf *Raft) streamEntries() {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		status := rf.status
 		rf.mu.Unlock()
-		if status == StatusLeader {
+		if status == Leader {
 			rf.doAppendEntries()
 		}
 		rf.sleep()
@@ -128,7 +130,7 @@ func (rf *Raft) streamEntries() {
 }
 
 func (rf *Raft) streamApplyMsg() {
-	for {
+	for !rf.killed() {
 		messages := []ApplyMsg{}
 		rf.mu.Lock()
 		newLastApplied := rf.volatileState.commitIndex
@@ -154,7 +156,7 @@ func (rf *Raft) streamApplyMsg() {
 func (rf *Raft) isLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.status == StatusLeader
+	return rf.status == Leader
 }
 
 func (rf *Raft) isTimeoutExpired() bool {
@@ -166,6 +168,7 @@ func (rf *Raft) isTimeoutExpired() bool {
 func (rf *Raft) callElection() {
 	rf.mu.Lock()
 	rf.persistentState.CurrentTerm += 1
+	rf.persistentState.VotedFor = rf.me
 	rf.lastLeaderMessageTime = time.Now().UTC()
 
 	electionMu := sync.Mutex{}
@@ -177,7 +180,7 @@ func (rf *Raft) callElection() {
 	replyCount := 1
 	rf.mu.Unlock()
 
-	for i := 0; i < totalCount; i++ {
+	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
@@ -198,14 +201,14 @@ func (rf *Raft) callElection() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			replyCount += 1
-			if success && rf.status == StatusCandidate {
+			if success && rf.status == Candidate {
 				rf.log("callElection -- received response %#v from %v", reply, peer)
 				if reply.VoteGranted {
 					voteCount += 1
 				} else if reply.CurrentTerm > rf.persistentState.CurrentTerm {
 					rf.persistentState.CurrentTerm = reply.CurrentTerm
 					rf.persist()
-					rf.status = StatusFollower
+					rf.status = Follower
 				}
 			}
 			electionCond.Broadcast()
@@ -218,13 +221,13 @@ func (rf *Raft) callElection() {
 	}
 	electionMu.Unlock()
 	rf.mu.Lock()
-	if rf.status != StatusCandidate {
+	if rf.status != Candidate {
 		rf.mu.Unlock()
 		return
 	}
 	if voteCount >= majorityCount {
 		rf.log("callElection -- won the election with %v votes", voteCount)
-		rf.status = StatusLeader
+		rf.status = Leader
 		rf.lastLeaderMessageTime = time.Now().UTC()
 		rf.initialiseNextIndex()
 		rf.initialiseMatchIndex()
@@ -281,7 +284,7 @@ func (rf *Raft) doAppendEntries() {
 					replyCount += 1
 					rf.mu.Lock()
 					if reply.Term > rf.persistentState.CurrentTerm {
-						rf.status = StatusFollower
+						rf.status = Follower
 						rf.persistentState.CurrentTerm = reply.Term
 						rf.persist()
 						rf.mu.Unlock()
@@ -309,7 +312,7 @@ func (rf *Raft) doAppendEntries() {
 	}
 	appendMu.Unlock()
 	rf.mu.Lock()
-	if rf.status != StatusLeader {
+	if rf.status != Leader {
 		rf.mu.Unlock()
 		return
 	}
@@ -345,7 +348,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persistentState.CurrentTerm, rf.status == StatusLeader
+	return rf.persistentState.CurrentTerm, rf.status == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -404,7 +407,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persistentState.CurrentTerm = args.Term
 		rf.persistentState.VotedFor = -1
 		rf.persist()
-		rf.status = StatusFollower
+		rf.status = Follower
 	}
 	reply.CurrentTerm = rf.persistentState.CurrentTerm
 	reply.VoteGranted = false
@@ -412,7 +415,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.log("RequestVote -- responding with response %#v (request term out of date)", reply)
 		return
 	}
-	if rf.status != StatusFollower {
+	if rf.status != Follower {
 		rf.log("RequestVote -- responding with response %#v (not a follower)", reply)
 		return
 	}
@@ -463,7 +466,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persistentState.CurrentTerm = args.Term
 		rf.persistentState.VotedFor = -1
 		rf.persist()
-		rf.status = StatusFollower
+		rf.status = Follower
 	}
 	reply.Term = rf.persistentState.CurrentTerm
 	reply.Success = false
@@ -548,7 +551,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	index := rf.getLastLogIndex() + 1
 	term := rf.persistentState.CurrentTerm
-	isLeader := rf.status == StatusLeader
+	isLeader := rf.status == Leader
 
 	if isLeader {
 		logs := []Log{{Term: term, Command: command}}
@@ -602,7 +605,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persistentState = &persistentState
 	volatileState := VolatileState{commitIndex: 0, lastApplied: 0, nextIndex: make([]int, peerCount), matchIndex: make([]int, peerCount)}
 	rf.volatileState = &volatileState
-	rf.status = StatusFollower
+	rf.status = Follower
 	rf.applyCh = applyCh
 
 	rf.lastLeaderMessageTime = time.Now().UTC()

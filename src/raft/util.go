@@ -15,23 +15,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func toStatusString(status int) string {
-	switch status {
-	case StatusFollower:
-		return "Follower"
-	case StatusCandidate:
-		return "Candidate"
-	case StatusLeader:
-		return "Leader"
-	default:
-		log.Fatalf("Unknown status")
-		return ""
-	}
-}
-
 func (rf *Raft) log(formatSpecifier string, args ...interface{}) {
-	status := toStatusString(rf.status)
-	raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, status, rf.persistentState.CurrentTerm)
+	raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, rf.status, rf.persistentState.CurrentTerm)
 	insertedLog := fmt.Sprintf(formatSpecifier, args...)
 	log.Printf("|| %v || %v", raftState, insertedLog)
 }
