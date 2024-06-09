@@ -1,31 +1,16 @@
 package raft
 
-import "sync"
 
 func (rf *Raft) sendLogsToFollowers(argsById map[int]AppendEntriesArgs) {
-	operation := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
-	cond := sync.NewCond(&operation.mu)
-
 	for i, args := range(argsById) {
 		go func(peer int) {
 			reply := AppendEntriesReply{}
 			success := rf.sendAppendEntries(peer, &args, &reply)
-			operation.mu.Lock()
-			operation.responseCount += 1
-			operation.mu.Unlock()
 			if success {
-				rf.processAppendEntriesReply(args, reply, &operation, peer)
-				cond.Broadcast()
+				rf.processAppendEntriesReply(args, reply, peer)
 			}
 		}(i)
 	}
-
-	operation.mu.Lock()
-	for operation.isPending() {
-		cond.Wait()
-	}
-	operation.mu.Unlock()
-	rf.updateLeaderCommitIndex()
 }
 
 func (rf *Raft) prepareAllAppendEntriesArgs() map[int]AppendEntriesArgs {
@@ -60,14 +45,11 @@ func (rf *Raft) prepareAppendEntriesArgs(peer int) AppendEntriesArgs {
 	return args
 }
 
-func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEntriesReply, operation *QuorumOperation, peer int) {
-	operation.mu.Lock()
-	defer operation.mu.Unlock()
+func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEntriesReply, peer int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	rf.log("processAppendEntriesReply -- received response %#v from peer %v", reply, peer)
-	operation.responseCount += 1
 	if reply.Term > rf.persistentState.CurrentTerm {
 		rf.role = Follower
 		rf.persistentState.CurrentTerm = reply.Term
@@ -82,21 +64,20 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 		rf.log("processAppendEntriesReply -- updating nextIndex to %v and matchIndex to %v for peer %v", index, index-1, peer)
 		rf.volatileState.nextIndex[peer] = index
 		rf.volatileState.matchIndex[peer] = index - 1
-		operation.successCount += 1
+		rf.updateLeaderCommitIndex()
 	} else {
 		rf.volatileState.nextIndex[peer] = max(1, reply.FirstConflictTermIndex)
 	}
 }
 
 func (rf *Raft) updateLeaderCommitIndex() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.role != Leader {
-		return
-	}
 	totalCount := len(rf.peers)
 	majorityCount := (totalCount + 1) / 2
 	for n := rf.volatileState.commitIndex + 1; n <= rf.getLastLogIndex(); n++ {
+		log := rf.getLogAtIndex(n)
+		if log.Term != rf.persistentState.CurrentTerm {
+			continue
+		}
 		count := 1
 		for peer, matchIndex := range rf.volatileState.matchIndex {
 			if peer == rf.me {

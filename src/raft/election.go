@@ -4,11 +4,31 @@ import (
 	"sync"
 )
 
+type Election struct {
+	participantCount int
+	mu               sync.Mutex
+	successCount     int
+	responseCount    int
+}
+
+func (e *Election) majority() int {
+	return (e.participantCount + 1) / 2
+}
+
+func (e *Election) isPending() bool {
+	majorityCount := e.majority()
+	return (e.successCount < majorityCount) && ((e.responseCount - e.successCount) <= majorityCount)
+}
+
+func (e *Election) isSuccess() bool {
+	return e.successCount >= e.majority()
+}
+
 func (rf *Raft) callElection(argsById map[int]RequestVoteArgs) {
-	election := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
+	election := Election{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
 	cond := sync.NewCond(&election.mu)
 
-	for i, args := range(argsById) {
+	for i, args := range argsById {
 		go func(peer int) {
 			reply := RequestVoteReply{}
 			success := rf.sendRequestVote(peer, &args, &reply)
@@ -52,7 +72,7 @@ func (rf *Raft) prepareRequestVoteArgs(peer int) RequestVoteArgs {
 	return args
 }
 
-func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *QuorumOperation, peer int) {
+func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *Election, peer int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.CurrentTerm > rf.persistentState.CurrentTerm {
@@ -74,7 +94,7 @@ func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *Quorum
 	}
 }
 
-func (rf *Raft) processElection(election *QuorumOperation) {
+func (rf *Raft) processElection(election *Election) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.role != Candidate {
@@ -88,5 +108,5 @@ func (rf *Raft) processElection(election *QuorumOperation) {
 	}
 	rf.log("processElection -- won the election with %v votes", election.successCount)
 	rf.wonElectionCh <- true
-	
+
 }
