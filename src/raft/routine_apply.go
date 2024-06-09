@@ -1,7 +1,7 @@
 package raft
 
 func (rf *Raft) streamToListener() {
-	for {
+	for !rf.killed() {
 		messages := []ApplyMsg{}
 		rf.mu.Lock()
 		newLastApplied := rf.volatileState.commitIndex
@@ -19,7 +19,5 @@ func (rf *Raft) streamToListener() {
 		rf.mu.Lock()
 		rf.volatileState.lastApplied = newLastApplied
 		rf.mu.Unlock()
-
-		rf.sleep()
 	}
 }

@@ -3,26 +3,18 @@ package raft
 import (
 	"fmt"
 	"log"
-	"time"
 )
 
 // Debugging
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
+const Debug = 1
 
 func toStatusString(status int) string {
 	switch status {
-	case StatusFollower:
+	case Follower:
 		return "Follower"
-	case StatusCandidate:
+	case Candidate:
 		return "Candidate"
-	case StatusLeader:
+	case Leader:
 		return "Leader"
 	default:
 		log.Fatalf("Unknown status")
@@ -31,32 +23,12 @@ func toStatusString(status int) string {
 }
 
 func (rf *Raft) log(formatSpecifier string, args ...interface{}) {
-	status := toStatusString(rf.status)
-	raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, status, rf.persistentState.CurrentTerm)
-	insertedLog := fmt.Sprintf(formatSpecifier, args...)
-	log.Printf("|| %v || %v", raftState, insertedLog)
-}
-
-func (rf *Raft) sleep() {
-	time.Sleep(50 * time.Millisecond)
-}
-
-func (rf *Raft) isLeader() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.status == StatusLeader
-}
-
-func (rf *Raft) isCandidate() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.status == StatusCandidate
-}
-
-func (rf *Raft) isTimeoutExpired() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return time.Now().UTC().After(rf.lastLeaderMessageTime.Add(rf.timeout))
+	if Debug > 0 {
+		status := toStatusString(rf.role)
+		raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v | CommitIndex: %v | NextIndex %#v", rf.me, status, rf.persistentState.CurrentTerm, rf.volatileState.commitIndex, rf.volatileState.nextIndex)
+		insertedLog := fmt.Sprintf(formatSpecifier, args...)
+		log.Printf("|| %v || %v", raftState, insertedLog)
+	}
 }
 
 // example code to send a RequestVote RPC to a server.

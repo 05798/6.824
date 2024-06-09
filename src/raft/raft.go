@@ -18,14 +18,10 @@ package raft
 //
 
 import (
-	"6.824/labrpc"
-
-	// "io"
-	// "log"
-	"math/rand"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"6.824/labrpc"
 )
 
 // import "bytes"
@@ -47,9 +43,9 @@ type ApplyMsg struct {
 }
 
 const (
-	StatusLeader    = iota
-	StatusFollower  = iota
-	StatusCandidate = iota
+	Leader    = iota
+	Follower  = iota
+	Candidate = iota
 )
 
 const (
@@ -89,10 +85,11 @@ type Raft struct {
 	// state a Raft server must maintain.
 	persistentState *PersistentState
 	volatileState   *VolatileState
-	status          int
+	role            int
 
-	lastLeaderMessageTime time.Time
-	timeout               time.Duration
+	heartbeatCh chan bool
+	votedCh	chan bool
+	wonElectionCh chan bool
 }
 
 // return currentTerm and whether this server
@@ -100,7 +97,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persistentState.CurrentTerm, rf.status == StatusLeader
+	return rf.persistentState.CurrentTerm, rf.role == Leader
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -120,7 +117,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	index := rf.getLastLogIndex() + 1
 	term := rf.persistentState.CurrentTerm
-	isLeader := rf.status == StatusLeader
+	isLeader := rf.role == Leader
 
 	if isLeader {
 		logs := []Log{{Term: term, Command: command}}
@@ -162,7 +159,6 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	// log.SetOutput(io.Discard)
 	peerCount := len(peers)
 	rf := &Raft{}
 	rf.peers = peers
@@ -174,18 +170,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persistentState = &persistentState
 	volatileState := VolatileState{commitIndex: 0, lastApplied: 0, nextIndex: make([]int, peerCount), matchIndex: make([]int, peerCount)}
 	rf.volatileState = &volatileState
-	rf.status = StatusFollower
+	rf.role = Follower
 	rf.applyCh = applyCh
 
-	rf.lastLeaderMessageTime = time.Now().UTC()
-	rf.timeout = time.Duration(minTimeoutMillis+rand.Intn(timeoutRangeMillis)) * time.Millisecond
+	rf.heartbeatCh = make(chan bool, 100)
+	rf.votedCh = make(chan bool, 100)
+	rf.wonElectionCh = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.streamEntriesToFollowers()
 	go rf.streamToListener()
-	go rf.monitorTimeout()
+	go rf.main()
 
 	return rf
 }

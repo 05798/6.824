@@ -2,18 +2,6 @@ package raft
 
 import "sync"
 
-func (rf *Raft) streamEntriesToFollowers() {
-	for {
-		rf.mu.Lock()
-		status := rf.status
-		rf.mu.Unlock()
-		if status == StatusLeader {
-			rf.sendLogsToFollowers()
-		}
-		rf.sleep()
-	}
-}
-
 func (rf *Raft) sendLogsToFollowers() {
 	rf.mu.Lock()
 	operation := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
@@ -25,21 +13,18 @@ func (rf *Raft) sendLogsToFollowers() {
 			continue
 		}
 		go func(peer int) {
-			for rf.isLeader() {
-				args := rf.prepareAppendEntriesArgs(peer)
-				reply := AppendEntriesReply{}
-				success := rf.sendAppendEntries(peer, &args, &reply)
-				if success {
-					rf.processAppendEntriesReply(args, reply, &operation, peer)
-					cond.Broadcast()
-					break
-				}
+			args := rf.prepareAppendEntriesArgs(peer)
+			reply := AppendEntriesReply{}
+			success := rf.sendAppendEntries(peer, &args, &reply)
+			if success {
+				rf.processAppendEntriesReply(args, reply, &operation, peer)
+				cond.Broadcast()
 			}
 		}(i)
 	}
 
 	operation.mu.Lock()
-	for operation.isPending() && rf.isLeader() {
+	for operation.isPending() {
 		cond.Wait()
 	}
 	operation.mu.Unlock()
@@ -74,14 +59,14 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 	defer operation.mu.Unlock()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.status != StatusLeader {
+	if rf.role != Leader {
 		return
 	}
 
 	rf.log("processAppendEntriesReply -- received response %#v from peer %v", reply, peer)
 	operation.responseCount += 1
 	if reply.Term > rf.persistentState.CurrentTerm {
-		rf.status = StatusFollower
+		rf.role = Follower
 		rf.persistentState.CurrentTerm = reply.Term
 		rf.persist()
 		return
@@ -100,9 +85,6 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 func (rf *Raft) updateLeaderCommitIndex() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.status != StatusLeader {
-		return
-	}
 	totalCount := len(rf.peers)
 	majorityCount := (totalCount + 1) / 2
 	for n := rf.volatileState.commitIndex + 1; ; n++ {
@@ -116,7 +98,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 			}
 		}
 		if count < majorityCount {
-			rf.log("updateLeaderCommitIndex -- setting leader commit to %v", n-1)
+			rf.log("updateLeaderCommitIndex -- setting leader commit to %v with match indices %#v", n-1, rf.volatileState.matchIndex)
 			rf.volatileState.commitIndex = n - 1
 			break
 		}

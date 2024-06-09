@@ -25,7 +25,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persistentState.CurrentTerm = args.Term
 		rf.persistentState.VotedFor = -1
 		rf.persist()
-		rf.status = StatusFollower
+		rf.role = Follower
 	}
 	reply.CurrentTerm = rf.persistentState.CurrentTerm
 	reply.VoteGranted = false
@@ -33,7 +33,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.log("RequestVote -- responding with response %#v (request term out of date)", reply)
 		return
 	}
-	if rf.status != StatusFollower {
+	if rf.role != Follower {
 		rf.log("RequestVote -- responding with response %#v (not a follower)", reply)
 		return
 	}
@@ -53,6 +53,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
+	rf.votedCh <- true
 	rf.persistentState.VotedFor = args.CandidateId
 	rf.persist()
 	reply.VoteGranted = true

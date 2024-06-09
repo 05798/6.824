@@ -5,7 +5,7 @@ import "sync"
 type QuorumOperation struct {
 	participantCount int
 	mu 				 sync.Mutex
-	successCount        int
+	successCount     int
 	responseCount    int
 }
 

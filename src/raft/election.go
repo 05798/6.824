@@ -2,25 +2,11 @@ package raft
 
 import (
 	"sync"
-	"time"
 )
-
-func (rf *Raft) monitorTimeout() {
-	for {
-		isExpired := rf.isTimeoutExpired()
-		if isExpired && !rf.isLeader() {
-			rf.log("monitorTimeout -- converting to candidate")
-			rf.status = StatusCandidate
-			rf.callElection()
-		}
-		rf.sleep()
-	}
-}
 
 func (rf *Raft) callElection() {
 	rf.mu.Lock()
 	rf.persistentState.CurrentTerm += 1
-	rf.lastLeaderMessageTime = time.Now().UTC()
 
 	election := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
 	cond := sync.NewCond(&election.mu)
@@ -37,7 +23,6 @@ func (rf *Raft) callElection() {
 			election.mu.Lock()
 			election.responseCount += 1
 			election.mu.Unlock()
-			// TODO(LL): retries?
 			if success {
 				rf.processRequestVoteReply(reply, &election, peer)
 			}
@@ -46,7 +31,7 @@ func (rf *Raft) callElection() {
 	}
 
 	election.mu.Lock()
-	for election.isPending() && rf.isCandidate() && !rf.isTimeoutExpired() {
+	for election.isPending() {
 		cond.Wait()
 	}
 	election.mu.Unlock()
@@ -69,14 +54,12 @@ func (rf *Raft) prepareRequestVoteArgs(peer int) RequestVoteArgs {
 func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *QuorumOperation, peer int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.status != StatusCandidate {
-		return
-	}
 	if reply.CurrentTerm > rf.persistentState.CurrentTerm {
 		rf.log("processRequestVoteReply -- converting to follower since observed higher term %v from peer %v", reply.CurrentTerm, peer)
+		rf.role = Follower
 		rf.persistentState.CurrentTerm = reply.CurrentTerm
+		rf.persistentState.VotedFor = -1
 		rf.persist()
-		rf.status = StatusFollower
 		return
 	}
 	if reply.VoteGranted {
@@ -85,27 +68,19 @@ func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *Quorum
 		election.mu.Lock()
 		defer election.mu.Unlock()
 		election.successCount += 1
-	} 
+	}
 }
 
 func (rf *Raft) processElection(election *QuorumOperation) {
 	rf.mu.Lock()
-	if rf.status != StatusCandidate {
-		rf.mu.Unlock()
-		return
-	}
+	defer rf.mu.Unlock()
 	election.mu.Lock()
 	defer election.mu.Unlock()
-	if election.isSuccess() {
-		rf.log("processElection -- won the election with %v votes", election.successCount)
-		rf.status = StatusLeader
-		rf.lastLeaderMessageTime = time.Now().UTC()
-		rf.initialiseNextIndex()
-		rf.initialiseMatchIndex()
-		rf.mu.Unlock()
-		rf.sendLogsToFollowers()
-	} else {
+	if !election.isSuccess() {
 		rf.log("processElection -- lost the election with %v votes", election.successCount)
-		rf.mu.Unlock()
+		return
 	}
+	rf.log("processElection -- won the election with %v votes", election.successCount)
+	rf.wonElectionCh <- true
+	
 }
