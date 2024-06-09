@@ -43,7 +43,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.PrevLogIndex > 0 {
 		prevLog := rf.getLogAtIndex(args.PrevLogIndex)
-		rf.log("AA %#v", prevLog)
 		if prevLog.Term != args.PrevLogTerm {
 			rf.log("AppendEntries -- responding with response %#v (inconsistent log entry %#v at PrevLogIndex %v)", reply, prevLog, args.PrevLogIndex)
 			reply.ConflictTerm = prevLog.Term
@@ -55,7 +54,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.volatileState.commitIndex {
 		rf.volatileState.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 	}
-	reply.Term = rf.persistentState.CurrentTerm
 	reply.Success = true
 	rf.log("AppendEntries -- responding with response %#v (successfully appended logs)", reply)
 }

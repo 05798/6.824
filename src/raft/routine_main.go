@@ -8,10 +8,9 @@ import (
 func (rf *Raft) main() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		role := rf.role
-		rf.mu.Unlock()
-		switch role {
+		switch rf.role {
 		case Follower:
+			rf.mu.Unlock()
 			select {
 			case <- rf.heartbeatCh:
 				// we received a valid AppendEntry
@@ -24,12 +23,16 @@ func (rf *Raft) main() {
 				rf.mu.Unlock()
 			}
 		case Candidate:
-			go rf.callElection()
+			rf.persistentState.CurrentTerm += 1
+			requestVoteArgsById := rf.prepareAllRequestVoteArgs()
+			rf.mu.Unlock()
+			go rf.callElection(requestVoteArgsById)
 			select {
 			case <- rf.heartbeatCh:
 				// we received a valid AppendEntry
 			case <- rf.wonElectionCh:
 				rf.mu.Lock()
+				rf.log("Becoming a leader")
 				rf.role = Leader
 				rf.initialiseNextIndex()
 				rf.initialiseMatchIndex()
@@ -38,7 +41,9 @@ func (rf *Raft) main() {
 				// Call another election
 			}
 		case Leader:
-			go rf.sendLogsToFollowers()
+			appendEntriesArgsById := rf.prepareAllAppendEntriesArgs()
+			rf.mu.Unlock()
+			go rf.sendLogsToFollowers(appendEntriesArgsById)
 			time.Sleep(50 * time.Millisecond)
 		}
 	}

@@ -4,20 +4,12 @@ import (
 	"sync"
 )
 
-func (rf *Raft) callElection() {
-	rf.mu.Lock()
-	rf.persistentState.CurrentTerm += 1
-
+func (rf *Raft) callElection(argsById map[int]RequestVoteArgs) {
 	election := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
 	cond := sync.NewCond(&election.mu)
-	rf.mu.Unlock()
 
-	for i := 0; i < election.participantCount; i++ {
-		if i == rf.me {
-			continue
-		}
+	for i, args := range(argsById) {
 		go func(peer int) {
-			args := rf.prepareRequestVoteArgs(peer)
 			reply := RequestVoteReply{}
 			success := rf.sendRequestVote(peer, &args, &reply)
 			election.mu.Lock()
@@ -38,9 +30,18 @@ func (rf *Raft) callElection() {
 	rf.processElection(&election)
 }
 
+func (rf *Raft) prepareAllRequestVoteArgs() map[int]RequestVoteArgs {
+	argsById := make(map[int]RequestVoteArgs)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		argsById[i] = rf.prepareRequestVoteArgs(i)
+	}
+	return argsById
+}
+
 func (rf *Raft) prepareRequestVoteArgs(peer int) RequestVoteArgs {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	lastLogIndex := rf.getLastLogIndex()
 	lastLogTerm := 0
 	if lastLogIndex > 0 {
@@ -62,8 +63,10 @@ func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *Quorum
 		rf.persist()
 		return
 	}
+	if rf.role != Candidate {
+		return
+	}
 	if reply.VoteGranted {
-		// This should probably be a method of the Election struct but putting it here makes logging easier :)
 		rf.log("processRequestVoteReply -- received vote from peer %v", peer)
 		election.mu.Lock()
 		defer election.mu.Unlock()
@@ -74,6 +77,9 @@ func (rf *Raft) processRequestVoteReply(reply RequestVoteReply, election *Quorum
 func (rf *Raft) processElection(election *QuorumOperation) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.role != Candidate {
+		return
+	}
 	election.mu.Lock()
 	defer election.mu.Unlock()
 	if !election.isSuccess() {

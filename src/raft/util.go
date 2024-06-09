@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging
-const Debug = 1
+const Debug = 0
 
 func toStatusString(status int) string {
 	switch status {
@@ -25,9 +25,10 @@ func toStatusString(status int) string {
 func (rf *Raft) log(formatSpecifier string, args ...interface{}) {
 	if Debug > 0 {
 		status := toStatusString(rf.role)
-		raftState := fmt.Sprintf("ID: %v | Status: %v | Term: %v | CommitIndex: %v | NextIndex %#v", rf.me, status, rf.persistentState.CurrentTerm, rf.volatileState.commitIndex, rf.volatileState.nextIndex)
+		raftStateSummary := fmt.Sprintf("ID: %v | Status: %v | Term: %v", rf.me, status, rf.persistentState.CurrentTerm)
+		raftStateDetail := fmt.Sprintf("volatileState: %#v | persistentState %#v", rf.volatileState, rf.persistentState)
 		insertedLog := fmt.Sprintf(formatSpecifier, args...)
-		log.Printf("|| %v || %v", raftState, insertedLog)
+		log.Printf("|| %v || %v\n%v", raftStateSummary, insertedLog, raftStateDetail)
 	}
 }
 

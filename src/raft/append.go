@@ -2,20 +2,17 @@ package raft
 
 import "sync"
 
-func (rf *Raft) sendLogsToFollowers() {
-	rf.mu.Lock()
+func (rf *Raft) sendLogsToFollowers(argsById map[int]AppendEntriesArgs) {
 	operation := QuorumOperation{participantCount: len(rf.peers), successCount: 1, responseCount: 1}
 	cond := sync.NewCond(&operation.mu)
-	rf.mu.Unlock()
 
-	for i := 0; i < operation.participantCount; i++ {
-		if i == rf.me {
-			continue
-		}
+	for i, args := range(argsById) {
 		go func(peer int) {
-			args := rf.prepareAppendEntriesArgs(peer)
 			reply := AppendEntriesReply{}
 			success := rf.sendAppendEntries(peer, &args, &reply)
+			operation.mu.Lock()
+			operation.responseCount += 1
+			operation.mu.Unlock()
 			if success {
 				rf.processAppendEntriesReply(args, reply, &operation, peer)
 				cond.Broadcast()
@@ -31,9 +28,18 @@ func (rf *Raft) sendLogsToFollowers() {
 	rf.updateLeaderCommitIndex()
 }
 
+func (rf *Raft) prepareAllAppendEntriesArgs() map[int]AppendEntriesArgs {
+	argsById := make(map[int]AppendEntriesArgs)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		argsById[i] = rf.prepareAppendEntriesArgs(i)
+	}
+	return argsById
+}
+
 func (rf *Raft) prepareAppendEntriesArgs(peer int) AppendEntriesArgs {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	prevLogIndex := rf.volatileState.nextIndex[peer] - 1
 	var prevLogTerm int
 	if prevLogIndex < 1 {
@@ -59,9 +65,6 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 	defer operation.mu.Unlock()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.role != Leader {
-		return
-	}
 
 	rf.log("processAppendEntriesReply -- received response %#v from peer %v", reply, peer)
 	operation.responseCount += 1
@@ -69,6 +72,9 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 		rf.role = Follower
 		rf.persistentState.CurrentTerm = reply.Term
 		rf.persist()
+		return
+	}
+	if rf.role != Leader {
 		return
 	}
 	if reply.Success {
@@ -85,9 +91,12 @@ func (rf *Raft) processAppendEntriesReply(args AppendEntriesArgs, reply AppendEn
 func (rf *Raft) updateLeaderCommitIndex() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return
+	}
 	totalCount := len(rf.peers)
 	majorityCount := (totalCount + 1) / 2
-	for n := rf.volatileState.commitIndex + 1; ; n++ {
+	for n := rf.volatileState.commitIndex + 1; n <= rf.getLastLogIndex(); n++ {
 		count := 1
 		for peer, matchIndex := range rf.volatileState.matchIndex {
 			if peer == rf.me {
@@ -98,9 +107,9 @@ func (rf *Raft) updateLeaderCommitIndex() {
 			}
 		}
 		if count < majorityCount {
-			rf.log("updateLeaderCommitIndex -- setting leader commit to %v with match indices %#v", n-1, rf.volatileState.matchIndex)
-			rf.volatileState.commitIndex = n - 1
 			break
 		}
+		rf.log("updateLeaderCommitIndex -- setting leader commit to %v with match indices %#v", n, rf.volatileState.matchIndex)
+		rf.volatileState.commitIndex = n
 	}
 }
